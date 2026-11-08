@@ -1,0 +1,150 @@
+name: TaskFlow CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-backend:
+    name: Backend Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }} with Cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install Dependencies
+        working-directory: ./backend
+        run: npm ci
+
+      - name: Run Unit & Integration Tests
+        working-directory: ./backend
+        env:
+          NODE_ENV: test
+        run: npm test
+
+  build-frontend:
+    name: Build Frontend Bundle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20 with Cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Frontend Dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Build Vite App
+        working-directory: ./frontend
+        env:
+          VITE_API_URL: ${{ secrets.EB_ENVIRONMENT_URL }}
+        run: npm run build
+
+      - name: Upload Frontend Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 1
+
+  package-backend:
+    name: Package Backend Bundle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Bundle Backend Application
+        working-directory: ./backend
+        run: |
+          zip -r ../backend-app.zip src Procfile package.json package-lock.json
+
+      - name: Upload Backend Zip Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-zip
+          path: backend-app.zip
+          retention-days: 1
+
+  deploy-frontend:
+    name: Deploy to S3 + CloudFront
+    needs: [ build-frontend ]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Built Frontend Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: ./dist
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Sync Static Files to S3
+        run: |
+          aws s3 sync ./dist s3://${{ secrets.S3_FRONTEND_BUCKET }} --delete
+
+      - name: Invalidate CloudFront CDN Cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+  deploy-backend:
+    name: Deploy to Elastic Beanstalk
+    needs: [ test-backend, package-backend ]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Packaged Backend Zip
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-zip
+          path: .
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy Version to Elastic Beanstalk
+        run: |
+          VERSION_LABEL="deploy-${{ github.sha }}-${{ github.run_number }}"
+          S3_KEY="taskflow-backend/${VERSION_LABEL}.zip"
+
+          aws s3 cp backend-app.zip s3://${{ secrets.EB_STORAGE_BUCKET }}/${S3_KEY}
+
+          aws elasticbeanstalk create-application-version \
+            --application-name "${{ secrets.EB_APP_NAME }}" \
+            --version-label "${VERSION_LABEL}" \
+            --source-bundle S3Bucket="${{ secrets.EB_STORAGE_BUCKET }}",S3Key="${S3_KEY}"
+
+          aws elasticbeanstalk update-environment \
+            --environment-name "${{ secrets.EB_ENV_NAME }}" \
+            --version-label "${VERSION_LABEL}"
+
